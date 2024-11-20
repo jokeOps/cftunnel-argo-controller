@@ -1,0 +1,9 @@
+apiVersion: cftunnel-argo.controller.cftunnel-argo.controller/v1alpha1
+kind: Tunnels
+metadata:
+  labels:
+    app.kubernetes.io/name: cftunnel-argo-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: tunnels-sample
+spec:
+  # TODO(user): Add fields here

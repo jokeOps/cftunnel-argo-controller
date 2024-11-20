@@ -1,0 +1,44 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - cftunnel-argo.controller.cftunnel-argo.controller
+  resources:
+  - tunnels
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cftunnel-argo.controller.cftunnel-argo.controller
+  resources:
+  - tunnels/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - cftunnel-argo.controller.cftunnel-argo.controller
+  resources:
+  - tunnels/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

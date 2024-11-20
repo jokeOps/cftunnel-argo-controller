@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- cftunnel-argo.controller_v1alpha1_tunnels.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples
