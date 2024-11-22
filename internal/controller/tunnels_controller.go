@@ -47,7 +47,6 @@ type TunnelsReconciler struct {
 //+kubebuilder:rbac:groups=cftunnel-argo.controller.cftunnel-argo.controller,resources=tunnels/finalizers,verbs=update
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 
-// Перемістіть функцію formatIngressRules за межі Reconcile
 func formatIngressRules(ingress []cftunnelargocontrollerv1alpha1.Ingress) string {
 	var rules []string
 	for _, ing := range ingress {
@@ -57,7 +56,6 @@ func formatIngressRules(ingress []cftunnelargocontrollerv1alpha1.Ingress) string
 	return strings.Join(rules, "\n")
 }
 
-// Додаємо нову структуру для відстеження стану
 type TunnelPodState struct {
 	DesiredReplicas int32
 	CurrentReplicas int32
@@ -65,14 +63,12 @@ type TunnelPodState struct {
 	UnhealthyPods   []string
 }
 
-// Додаємо метод для перевірки здоров'я подів
 func (r *TunnelsReconciler) checkPodsHealth(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (*TunnelPodState, error) {
 	logger := log.FromContext(ctx)
 	state := &TunnelPodState{
 		DesiredReplicas: tunnels.Spec.Replicas,
 	}
 
-	// Отримуємо список подів з відповідною міткою
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList, client.InNamespace(tunnels.Namespace), client.MatchingLabels{"app": tunnels.Name}); err != nil {
 		return nil, err
@@ -80,7 +76,6 @@ func (r *TunnelsReconciler) checkPodsHealth(ctx context.Context, tunnels *cftunn
 
 	state.CurrentReplicas = int32(len(podList.Items))
 
-	// Перевіряємо стан кожного поду
 	for _, pod := range podList.Items {
 		if pod.Status.Phase == corev1.PodRunning {
 			state.AvailablePods = append(state.AvailablePods, pod.Name)
@@ -93,17 +88,14 @@ func (r *TunnelsReconciler) checkPodsHealth(ctx context.Context, tunnels *cftunn
 	return state, nil
 }
 
-// Додаємо нову функцію для пошуку наступного доступного індексу
 func (r *TunnelsReconciler) findNextAvailableIndex(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (int, error) {
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList, client.InNamespace(tunnels.Namespace), client.MatchingLabels{"app": tunnels.Name}); err != nil {
 		return 0, err
 	}
 
-	// Створюємо мапу існуючих індексів
 	usedIndices := make(map[int]bool)
 	for _, pod := range podList.Items {
-		// Витягуємо індекс з імені поду
 		var index int
 		_, err := fmt.Sscanf(pod.Name, tunnels.Name+"-tunnel-%d", &index)
 		if err == nil {
@@ -111,8 +103,7 @@ func (r *TunnelsReconciler) findNextAvailableIndex(ctx context.Context, tunnels 
 		}
 	}
 
-	// Шукаємо перший вільний індекс
-	for i := 0; i < 1000; i++ { // Обмежуємо пошук для безпеки
+	for i := 0; i < 1000; i++ {
 		if !usedIndices[i] {
 			return i, nil
 		}
@@ -121,12 +112,10 @@ func (r *TunnelsReconciler) findNextAvailableIndex(ctx context.Context, tunnels 
 	return 0, fmt.Errorf("no available indices found")
 }
 
-// Оновлюємо функцію createPod
 func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, index int) error {
 	logger := log.FromContext(ctx)
 	podName := fmt.Sprintf("%s-tunnel-%d", tunnels.Name, index)
 
-	// Перевіряємо чи под вже існує
 	existingPod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{
 		Namespace: tunnels.Namespace,
@@ -134,15 +123,12 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	}, existingPod)
 
 	if err == nil {
-		// Под вже існує
 		logger.Info("Pod already exists", "pod", podName)
 		return nil
 	} else if !errors.IsNotFound(err) {
-		// Сталася помилка при перевірці
 		return err
 	}
 
-	// Створюємо новий под
 	logger.Info("Creating new pod", "name", podName)
 	logger.Info("Creating pod", "name", fmt.Sprintf("%s-tunnel-%d", tunnels.Name, index))
 
@@ -150,6 +136,15 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	if tunnels.Spec.Image != "" {
 		image = tunnels.Spec.Image
 	}
+
+	annotations := make(map[string]string)
+
+	if tunnels.GetAnnotations() != nil {
+		for k, v := range tunnels.GetAnnotations() {
+			annotations[k] = v
+		}
+	}
+	annotations["lastResourceVersion"] = tunnels.ResourceVersion
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -159,6 +154,7 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 				"app":        tunnels.Name,
 				"controller": "custom",
 			},
+			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(tunnels, tunnels.GroupVersionKind()),
 			},
@@ -224,17 +220,14 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	return r.Create(ctx, pod)
 }
 
-// Оновлюємо Reconcile для прямого керування подами
 func (r *TunnelsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Отримуємо об'єкт Tunnels
 	var tunnels cftunnelargocontrollerv1alpha1.Tunnels
 	if err := r.Get(ctx, req.NamespacedName, &tunnels); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Створюємо ConfigMap
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      tunnels.Name + "-" + tunnels.Spec.TunnelName + "-config",
@@ -256,20 +249,17 @@ ingress:
 		},
 	}
 
-	// Створюємо або оновлюємо ConfigMap
 	if err := r.Create(ctx, configMap); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			logger.Error(err, "failed to create ConfigMap")
 			return ctrl.Result{}, err
 		}
-		// Якщо ConfigMap вже існує, оновлюємо його
 		if err := r.Update(ctx, configMap); err != nil {
 			logger.Error(err, "failed to update ConfigMap")
 			return ctrl.Result{}, err
 		}
 	}
 
-	// Створюємо Secret
 	credentialsJSON := fmt.Sprintf(`{
 		"AccountTag":   "%s",
 		"TunnelID":    "%s",
@@ -290,34 +280,30 @@ ingress:
 		},
 	}
 
-	// Створюємо або оновлюємо Secret
 	if err := r.Create(ctx, secret); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			logger.Error(err, "failed to create Secret")
 			return ctrl.Result{}, err
 		}
-		// Якщо Secret вже існує, оновлюємо його
 		if err := r.Update(ctx, secret); err != nil {
 			logger.Error(err, "failed to update Secret")
 			return ctrl.Result{}, err
 		}
 	}
 
-	// Перевіряємо стан подів
 	podState, err := r.checkPodsHealth(ctx, &tunnels)
 	if err != nil {
 		logger.Error(err, "failed to check pods health")
 		return ctrl.Result{}, err
 	}
 
-	// Якщо кількість подів не відповідає бажаній
-	if podState.CurrentReplicas < podState.DesiredReplicas {
-		logger.Info("Need to create new pods",
-			"current", podState.CurrentReplicas,
-			"desired", podState.DesiredReplicas)
+	desiredReplicas := int(tunnels.Spec.Replicas)
+	if len(podState.AvailablePods) < desiredReplicas {
+		logger.Info("Not enough running pods, creating new ones",
+			"current", len(podState.AvailablePods),
+			"desired", desiredReplicas)
 
-		// Створюємо необхідну кількість подів
-		for i := int32(0); i < podState.DesiredReplicas-podState.CurrentReplicas; i++ {
+		for i := len(podState.AvailablePods); i < desiredReplicas; i++ {
 			nextIndex, err := r.findNextAvailableIndex(ctx, &tunnels)
 			if err != nil {
 				logger.Error(err, "failed to find next available index")
@@ -325,44 +311,155 @@ ingress:
 			}
 
 			if err := r.createPod(ctx, &tunnels, nextIndex); err != nil {
-				logger.Error(err, "failed to create pod", "index", nextIndex)
-				return ctrl.Result{}, err
+				if !errors.IsAlreadyExists(err) {
+					logger.Error(err, "failed to create new pod", "index", nextIndex)
+					return ctrl.Result{}, err
+				}
 			}
 			logger.Info("Created new pod", "index", nextIndex)
 		}
-
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 	}
 
-	// Якщо є нездорові поди
-	if len(podState.UnhealthyPods) > 0 {
-		logger.Info("Unhealthy pods detected", "count", len(podState.UnhealthyPods))
+	needsUpdate := false
+	for _, pod := range podState.AvailablePods {
+		if r.isPodOutdated(ctx, &tunnels, pod) {
+			needsUpdate = true
+			break
+		}
+	}
 
-		// Видаляємо нездорові поди
-		for _, podName := range podState.UnhealthyPods {
-			pod := &corev1.Pod{}
+	if needsUpdate {
+		logger.Info("Starting rolling update of pods")
+
+		newPods := make(map[string]bool)
+
+		for i := 0; i < len(podState.AvailablePods); i++ {
+			nextIndex, err := r.findNextAvailableIndex(ctx, &tunnels)
+			if err != nil {
+				logger.Error(err, "failed to find next available index")
+				return ctrl.Result{}, err
+			}
+
+			podName := fmt.Sprintf("%s-tunnel-%d", tunnels.Name, nextIndex)
+
 			if err := r.Get(ctx, types.NamespacedName{
 				Name:      podName,
 				Namespace: tunnels.Namespace,
-			}, pod); err != nil {
-				if !errors.IsNotFound(err) {
-					logger.Error(err, "failed to get unhealthy pod")
+			}, &corev1.Pod{}); err == nil {
+				continue
+			}
+
+			if err := r.createPod(ctx, &tunnels, nextIndex); err != nil {
+				if !errors.IsAlreadyExists(err) {
+					logger.Error(err, "failed to create new pod", "index", nextIndex)
+					return ctrl.Result{}, err
+				}
+			}
+			newPods[podName] = true
+			logger.Info("Created new pod", "index", nextIndex)
+		}
+
+		if err := r.waitForNewPodsHealthy(ctx, &tunnels, desiredReplicas); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		for _, podName := range podState.AvailablePods {
+			if !newPods[podName] {
+				pod := &corev1.Pod{}
+				if err := r.Get(ctx, types.NamespacedName{
+					Name:      podName,
+					Namespace: tunnels.Namespace,
+				}, pod); err != nil {
+					if !errors.IsNotFound(err) {
+						return ctrl.Result{}, err
+					}
 					continue
 				}
+
+				if err := r.Delete(ctx, pod); err != nil {
+					if !errors.IsNotFound(err) {
+						return ctrl.Result{}, err
+					}
+				}
+				logger.Info("Deleted old pod", "pod", podName)
+			}
+		}
+	}
+
+	if len(podState.AvailablePods) > desiredReplicas {
+		logger.Info("Too many running pods, removing excess",
+			"current", len(podState.AvailablePods),
+			"desired", desiredReplicas)
+
+		podsToRemove := len(podState.AvailablePods) - desiredReplicas
+		for i := 0; i < podsToRemove; i++ {
+			pod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      podState.AvailablePods[i],
+				Namespace: tunnels.Namespace,
+			}, pod); err != nil {
+				if !errors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+				continue
 			}
 
 			if err := r.Delete(ctx, pod); err != nil {
 				if !errors.IsNotFound(err) {
-					logger.Error(err, "failed to delete unhealthy pod")
+					return ctrl.Result{}, err
 				}
 			}
+			logger.Info("Deleted excess pod", "pod", podState.AvailablePods[i])
 		}
-
-		// Запланувати повторну перевірку через 10 секунд
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: time.Minute}, nil
+	return ctrl.Result{RequeueAfter: time.Second * 10}, nil
+}
+
+func (r *TunnelsReconciler) isPodOutdated(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, podName string) bool {
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      podName,
+		Namespace: tunnels.Namespace,
+	}, pod); err != nil {
+		return false
+	}
+
+	// if !reflect.DeepEqual(pod.Annotations, tunnels.GetAnnotations()) {
+	// 	return true
+	// }
+
+	oldResourceVersion := pod.Annotations["lastResourceVersion"]
+	if oldResourceVersion != tunnels.ResourceVersion {
+		return true
+	}
+
+	return false
+}
+
+func (r *TunnelsReconciler) waitForNewPodsHealthy(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, expectedPods int) error {
+	logger := log.FromContext(ctx)
+
+	for i := 0; i < 60; i++ {
+		podState, err := r.checkPodsHealth(ctx, tunnels)
+		if err != nil {
+			return err
+		}
+
+		if len(podState.AvailablePods) >= expectedPods && len(podState.UnhealthyPods) == 0 {
+			logger.Info("All new pods are healthy", "count", len(podState.AvailablePods))
+			return nil
+		}
+
+		logger.Info("Waiting for new pods to become healthy",
+			"available", len(podState.AvailablePods),
+			"expected", expectedPods,
+			"unhealthy", len(podState.UnhealthyPods))
+
+		time.Sleep(5 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for new pods to become healthy")
 }
 
 // SetupWithManager sets up the controller with the Manager.
