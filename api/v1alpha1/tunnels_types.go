@@ -48,6 +48,7 @@ type TunnelsSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	AccountNumber string `json:"accountNumber"`
 	// +kubebuilder:validation:Required
+	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Replicas int32 `json:"replicas"`
 
@@ -55,8 +56,30 @@ type TunnelsSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	Ingress []Ingress `json:"ingress"`
 
-	EnableWrapping bool   `json:"enableWrapping,omitempty"`
-	Image          string `json:"image,omitempty"`
+	EnableWrapping bool `json:"enableWrapping,omitempty"`
+	// +kubebuilder:default="cloudflare/cloudflared:latest"
+	Image string `json:"image,omitempty"`
+	// +kubebuilder:default=info
+	// +kubebuilder:validation:Enum=debug;info;warn;error;fatal
+	TunnelLogLevel string `json:"tunnelLogLevel,omitempty"`
+	// +kubebuilder:default=us
+	TunnelRegion string `json:"tunnelRegion,omitempty"`
+	// +kubebuilder:default=5
+	// +kubebuilder:validation:Minimum=1
+	TunnelRetries int32 `json:"tunnelRetries,omitempty"`
+	// +kubebuilder:default=auto
+	// +kubebuilder:validation:Enum=auto;http2;quic
+	TunnelProtocol string `json:"tunnelProtocol,omitempty"`
+	// +kubebuilder:default="30s"
+	TunnelConnectTimeout string `json:"tunnelConnectTimeout,omitempty"`
+	// +kubebuilder:default="1m30s"
+	TunnelKeepAliveTimeout string `json:"tunnelKeepAliveTimeout,omitempty"`
+	// +kubebuilder:default=100
+	// +kubebuilder:validation:Minimum=1
+	TunnelKeepAliveConnections int32 `json:"tunnelKeepAliveConnections,omitempty"`
+	// +kubebuilder:default=30
+	// +kubebuilder:validation:Minimum=1
+	TunnelGracePeriodSeconds int64 `json:"tunnelGracePeriodSeconds,omitempty"`
 }
 
 // TunnelsStatus defines the observed state of Tunnels

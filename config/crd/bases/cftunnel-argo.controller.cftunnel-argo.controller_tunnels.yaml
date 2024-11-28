@@ -55,6 +55,7 @@ spec:
               enableWrapping:
                 type: boolean
               image:
+                default: cloudflare/cloudflared:latest
                 type: string
               ingress:
                 items:
@@ -70,15 +71,56 @@ spec:
                 minItems: 1
                 type: array
               replicas:
+                default: 1
                 format: int32
+                minimum: 1
+                type: integer
+              tunnelConnectTimeout:
+                default: 30s
+                type: string
+              tunnelGracePeriodSeconds:
+                default: 30
+                format: int64
                 minimum: 1
                 type: integer
               tunnelID:
                 minLength: 1
                 type: string
+              tunnelKeepAliveConnections:
+                default: 100
+                format: int32
+                minimum: 1
+                type: integer
+              tunnelKeepAliveTimeout:
+                default: 1m30s
+                type: string
+              tunnelLogLevel:
+                default: info
+                enum:
+                - debug
+                - info
+                - warn
+                - error
+                - fatal
+                type: string
               tunnelName:
                 minLength: 1
                 type: string
+              tunnelProtocol:
+                default: auto
+                enum:
+                - auto
+                - http2
+                - quic
+                type: string
+              tunnelRegion:
+                default: us
+                type: string
+              tunnelRetries:
+                default: 5
+                format: int32
+                minimum: 1
+                type: integer
               tunnelSecret:
                 minLength: 1
                 type: string

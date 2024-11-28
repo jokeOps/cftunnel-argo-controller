@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +57,15 @@ func formatIngressRules(ingress []cftunnelargocontrollerv1alpha1.Ingress) string
 	return strings.Join(rules, "\n")
 }
 
+func removeElementFromList(slice []string, name string) []string {
+	for i, v := range slice {
+		if v == name {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}
+
 type TunnelPodState struct {
 	DesiredReplicas int32
 	CurrentReplicas int32
@@ -63,29 +73,168 @@ type TunnelPodState struct {
 	UnhealthyPods   []string
 }
 
-func (r *TunnelsReconciler) checkPodsHealth(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (*TunnelPodState, error) {
+func (r *TunnelsReconciler) getNodesName(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (string, error) {
+	nodesName := &corev1.NodeList{}
 	logger := log.FromContext(ctx)
-	state := &TunnelPodState{
-		DesiredReplicas: tunnels.Spec.Replicas,
+	logger.Info("Getting nodes name")
+
+	if err := r.List(ctx, nodesName); err != nil {
+		return "", err
 	}
 
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList, client.InNamespace(tunnels.Namespace), client.MatchingLabels{"app": tunnels.Name}); err != nil {
-		return nil, err
+		return "", err
 	}
 
-	state.CurrentReplicas = int32(len(podList.Items))
+	nodes := []string{}
 
-	for _, pod := range podList.Items {
-		if pod.Status.Phase == corev1.PodRunning {
-			state.AvailablePods = append(state.AvailablePods, pod.Name)
+	for _, node := range nodesName.Items {
+		if _, exists := node.Labels["node-role.kubernetes.io/control-plane"]; exists {
+			continue
 		} else {
-			state.UnhealthyPods = append(state.UnhealthyPods, pod.Name)
-			logger.Info("Unhealthy pod detected", "pod", pod.Name, "phase", pod.Status.Phase)
+			nodes = append(nodes, node.Name)
 		}
 	}
 
-	return state, nil
+	for _, node := range nodesName.Items {
+		for _, pod := range podList.Items {
+			if pod.Spec.NodeName == node.Name {
+				nodes = removeElementFromList(nodes, node.Name)
+			}
+		}
+	}
+	if len(nodes) == 0 {
+		return "", nil
+	}
+
+	logger.Info(fmt.Sprintf("Assigned node %s", nodes[0]))
+
+	return nodes[0], nil
+}
+
+func (r *TunnelsReconciler) checkConfigMap(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Checking ConfigMap")
+
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tunnels.Name + "-" + tunnels.Spec.TunnelName + "-config",
+			Namespace: tunnels.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(tunnels, tunnels.GroupVersionKind()),
+			},
+			Annotations: map[string]string{
+				"lastResourceVersion": tunnels.ResourceVersion,
+			},
+		},
+		Data: map[string]string{
+			"config.yaml": fmt.Sprintf(`tunnel: %s
+credentials-file: /etc/cloudflared/creds/credentials.json
+warp-routing:
+  enabled: %t
+originRequest: 
+  connectTimeout: %s
+  keepAliveTimeout: %s
+  keepAliveConnections: %d
+no-autoupdate: true
+ingress:
+%s
+  - service: http_status:404`,
+				tunnels.Spec.TunnelName,
+				tunnels.Spec.EnableWrapping,
+				tunnels.Spec.TunnelConnectTimeout,
+				tunnels.Spec.TunnelKeepAliveTimeout,
+				tunnels.Spec.TunnelKeepAliveConnections,
+				formatIngressRules(tunnels.Spec.Ingress)),
+		},
+	}
+
+	existingConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      configMap.Name,
+		Namespace: configMap.Namespace,
+	}, existingConfigMap); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "failed to get ConfigMap")
+			return err
+		} else {
+			logger.Info("ConfigMap not found, creating")
+			if err := r.Create(ctx, configMap); err != nil {
+				logger.Error(err, "failed to create ConfigMap")
+				return err
+			}
+		}
+	}
+
+	if existingConfigMap.Annotations["lastResourceVersion"] == tunnels.ResourceVersion {
+		logger.Info("ConfigMap is up to date")
+		return nil
+	} else {
+		logger.Info("ConfigMap is outdated, updating")
+		if err := r.Update(ctx, configMap); err != nil {
+			logger.Error(err, "failed to update ConfigMap")
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *TunnelsReconciler) checkSecret(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Checking Secret")
+
+	credentialsJSON := fmt.Sprintf(`{
+		"AccountTag":   "%s",
+		"TunnelID":    "%s",
+		"TunnelSecret": "%s"
+	}`, tunnels.Spec.AccountNumber, tunnels.Spec.TunnelID, tunnels.Spec.TunnelSecret)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tunnels.Name + "-" + tunnels.Spec.TunnelName + "-credentials",
+			Namespace: tunnels.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(tunnels, tunnels.GroupVersionKind()),
+			},
+			Annotations: map[string]string{
+				"lastResourceVersion": tunnels.ResourceVersion,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		StringData: map[string]string{
+			"credentials.json": credentialsJSON,
+		},
+	}
+	existingSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      secret.Name,
+		Namespace: secret.Namespace,
+	}, existingSecret); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "failed to get Secret")
+			return err
+		} else {
+			logger.Info("Secret not found, creating")
+			if err := r.Create(ctx, secret); err != nil {
+				logger.Error(err, "failed to create Secret")
+				return err
+			}
+		}
+	}
+
+	if existingSecret.Annotations["lastResourceVersion"] == tunnels.ResourceVersion {
+		logger.Info("Secret is up to date")
+		return nil
+	} else {
+		logger.Info("Secret is outdated, updating")
+		if err := r.Update(ctx, secret); err != nil {
+			logger.Error(err, "failed to update Secret")
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (r *TunnelsReconciler) findNextAvailableIndex(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (int, error) {
@@ -116,8 +265,14 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	logger := log.FromContext(ctx)
 	podName := fmt.Sprintf("%s-tunnel-%d", tunnels.Name, index)
 
+	nodeName, err := r.getNodesName(ctx, tunnels)
+	if err != nil {
+		logger.Error(err, "failed to get nodes name")
+		return err
+	}
+
 	existingPod := &corev1.Pod{}
-	err := r.Get(ctx, types.NamespacedName{
+	err = r.Get(ctx, types.NamespacedName{
 		Namespace: tunnels.Namespace,
 		Name:      podName,
 	}, existingPod)
@@ -128,9 +283,6 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	} else if !errors.IsNotFound(err) {
 		return err
 	}
-
-	logger.Info("Creating new pod", "name", podName)
-	logger.Info("Creating pod", "name", fmt.Sprintf("%s-tunnel-%d", tunnels.Name, index))
 
 	image := "cloudflare/cloudflared:2024.8.3"
 	if tunnels.Spec.Image != "" {
@@ -146,14 +298,21 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	}
 	annotations["lastResourceVersion"] = tunnels.ResourceVersion
 
+	labels := make(map[string]string)
+
+	if tunnels.GetLabels() != nil {
+		for k, v := range tunnels.GetLabels() {
+			labels[k] = v
+		}
+	}
+	labels["app"] = tunnels.Name
+	labels["controller"] = "custom"
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-tunnel-%d", tunnels.Name, index),
-			Namespace: tunnels.Namespace,
-			Labels: map[string]string{
-				"app":        tunnels.Name,
-				"controller": "custom",
-			},
+			Name:        fmt.Sprintf("%s-tunnel-%d", tunnels.Name, index),
+			Namespace:   tunnels.Namespace,
+			Labels:      labels,
 			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(tunnels, tunnels.GroupVersionKind()),
@@ -170,6 +329,39 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 						"/etc/cloudflared/config/config.yaml",
 						"run",
 					},
+					Env: []corev1.EnvVar{
+						{
+							Name:  "TUNNEL_LOGLEVEL",
+							Value: tunnels.Spec.TunnelLogLevel,
+						},
+						{
+							Name:  "TUNNEL_METRICS",
+							Value: "0.0.0.0:2000",
+						},
+						{
+							Name:  "TUNNEL_REGION",
+							Value: tunnels.Spec.TunnelRegion,
+						},
+						{
+							Name:  "TUNNEL_RETRIES",
+							Value: strconv.Itoa(int(tunnels.Spec.TunnelRetries)),
+						},
+						{
+							Name:  "TUNNEL_PROTOCOL",
+							Value: tunnels.Spec.TunnelProtocol,
+						},
+						{
+							Name:  "TUNNEL_GRACE_PERIOD",
+							Value: fmt.Sprintf("%ds", tunnels.Spec.TunnelGracePeriodSeconds),
+						},
+					},
+					Ports: []corev1.ContainerPort{
+						{
+							ContainerPort: 2000,
+							Protocol:      corev1.ProtocolTCP,
+							Name:          "metrics",
+						},
+					},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "config",
@@ -181,6 +373,16 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 							MountPath: "/etc/cloudflared/creds",
 							ReadOnly:  true,
 						},
+					},
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/ready",
+								Port: intstr.FromInt(2000),
+							},
+						},
+						InitialDelaySeconds: 10,
+						PeriodSeconds:       15,
 					},
 					LivenessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -194,6 +396,8 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 					},
 				},
 			},
+			TerminationGracePeriodSeconds: &tunnels.Spec.TunnelGracePeriodSeconds,
+			NodeName:                      nodeName,
 			Volumes: []corev1.Volume{
 				{
 					Name: "config",
@@ -220,6 +424,115 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	return r.Create(ctx, pod)
 }
 
+func (r *TunnelsReconciler) checkService(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Creating Service")
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tunnels.Name + "-service",
+			Namespace: tunnels.Namespace,
+			Labels: map[string]string{
+				"app":        tunnels.Name,
+				"controller": "custom",
+			},
+			Annotations: map[string]string{
+				"lastResourceVersion": tunnels.ResourceVersion,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(tunnels, tunnels.GroupVersionKind()),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app":        tunnels.Name,
+				"controller": "custom",
+			},
+			Type: corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{
+					Port:       2000,
+					TargetPort: intstr.FromInt(2000),
+					Protocol:   corev1.ProtocolTCP,
+					Name:       "metrics",
+				},
+			},
+		},
+	}
+
+	existingService := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      tunnels.Name + "-service",
+		Namespace: service.Namespace,
+	}, existingService); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "failed to get Service")
+			return err
+		} else {
+			logger.Info("Service not found, creating")
+			if err := r.Create(ctx, service); err != nil {
+				logger.Error(err, "failed to create Service")
+				return err
+			}
+		}
+	}
+
+	if existingService.Annotations["lastResourceVersion"] == tunnels.ResourceVersion {
+		logger.Info("Service is up to date")
+		return nil
+	} else {
+		logger.Info("Service is outdated, updating")
+		if err := r.Update(ctx, service); err != nil {
+			logger.Error(err, "failed to update Service")
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *TunnelsReconciler) checkPodsHealth(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (*TunnelPodState, error) {
+	logger := log.FromContext(ctx)
+	state := &TunnelPodState{
+		DesiredReplicas: tunnels.Spec.Replicas,
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(tunnels.Namespace), client.MatchingLabels{"app": tunnels.Name}); err != nil {
+		return nil, err
+	}
+
+	state.CurrentReplicas = int32(len(podList.Items))
+
+	for _, pod := range podList.Items {
+		if pod.Status.Phase == corev1.PodRunning {
+			state.AvailablePods = append(state.AvailablePods, pod.Name)
+		} else {
+			state.UnhealthyPods = append(state.UnhealthyPods, pod.Name)
+			logger.Info("Unhealthy pod detected", "pod", pod.Name, "phase", pod.Status.Phase)
+		}
+	}
+
+	return state, nil
+}
+
+func (r *TunnelsReconciler) isPodOutdated(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, podName string) bool {
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      podName,
+		Namespace: tunnels.Namespace,
+	}, pod); err != nil {
+		return false
+	}
+
+	oldResourceVersion := pod.Annotations["lastResourceVersion"]
+	if oldResourceVersion != tunnels.ResourceVersion {
+		return true
+	}
+
+	return false
+}
+
 func (r *TunnelsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -228,67 +541,18 @@ func (r *TunnelsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      tunnels.Name + "-" + tunnels.Spec.TunnelName + "-config",
-			Namespace: tunnels.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(&tunnels, tunnels.GroupVersionKind()),
-			},
-		},
-		Data: map[string]string{
-			"config.yaml": fmt.Sprintf(`tunnel: %s
-credentials-file: /etc/cloudflared/creds/credentials.json
-warp-routing:
-  enabled: %t
-metrics: 0.0.0.0:2000
-no-autoupdate: true
-ingress:
-%s
-  - service: http_status:404`, tunnels.Spec.TunnelName, tunnels.Spec.EnableWrapping, formatIngressRules(tunnels.Spec.Ingress)),
-		},
+	if err := r.checkConfigMap(ctx, &tunnels); err != nil {
+		logger.Error(err, "failed to check ConfigMap")
+		return ctrl.Result{}, err
+	}
+	if err := r.checkSecret(ctx, &tunnels); err != nil {
+		logger.Error(err, "failed to check ConfigMap")
+		return ctrl.Result{}, err
 	}
 
-	if err := r.Create(ctx, configMap); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "failed to create ConfigMap")
-			return ctrl.Result{}, err
-		}
-		if err := r.Update(ctx, configMap); err != nil {
-			logger.Error(err, "failed to update ConfigMap")
-			return ctrl.Result{}, err
-		}
-	}
-
-	credentialsJSON := fmt.Sprintf(`{
-		"AccountTag":   "%s",
-		"TunnelID":    "%s",
-		"TunnelSecret": "%s"
-	}`, tunnels.Spec.AccountNumber, tunnels.Spec.TunnelID, tunnels.Spec.TunnelSecret)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      tunnels.Name + "-" + tunnels.Spec.TunnelName + "-credentials",
-			Namespace: tunnels.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(&tunnels, tunnels.GroupVersionKind()),
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		StringData: map[string]string{
-			"credentials.json": credentialsJSON,
-		},
-	}
-
-	if err := r.Create(ctx, secret); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "failed to create Secret")
-			return ctrl.Result{}, err
-		}
-		if err := r.Update(ctx, secret); err != nil {
-			logger.Error(err, "failed to update Secret")
-			return ctrl.Result{}, err
-		}
+	if err := r.checkService(ctx, &tunnels); err != nil {
+		logger.Error(err, "failed to check Service")
+		return ctrl.Result{}, err
 	}
 
 	podState, err := r.checkPodsHealth(ctx, &tunnels)
@@ -359,10 +623,6 @@ ingress:
 			logger.Info("Created new pod", "index", nextIndex)
 		}
 
-		if err := r.waitForNewPodsHealthy(ctx, &tunnels, desiredReplicas); err != nil {
-			return ctrl.Result{}, err
-		}
-
 		for _, podName := range podState.AvailablePods {
 			if !newPods[podName] {
 				pod := &corev1.Pod{}
@@ -414,52 +674,6 @@ ingress:
 	}
 
 	return ctrl.Result{RequeueAfter: time.Second * 10}, nil
-}
-
-func (r *TunnelsReconciler) isPodOutdated(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, podName string) bool {
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      podName,
-		Namespace: tunnels.Namespace,
-	}, pod); err != nil {
-		return false
-	}
-
-	// if !reflect.DeepEqual(pod.Annotations, tunnels.GetAnnotations()) {
-	// 	return true
-	// }
-
-	oldResourceVersion := pod.Annotations["lastResourceVersion"]
-	if oldResourceVersion != tunnels.ResourceVersion {
-		return true
-	}
-
-	return false
-}
-
-func (r *TunnelsReconciler) waitForNewPodsHealthy(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, expectedPods int) error {
-	logger := log.FromContext(ctx)
-
-	for i := 0; i < 60; i++ {
-		podState, err := r.checkPodsHealth(ctx, tunnels)
-		if err != nil {
-			return err
-		}
-
-		if len(podState.AvailablePods) >= expectedPods && len(podState.UnhealthyPods) == 0 {
-			logger.Info("All new pods are healthy", "count", len(podState.AvailablePods))
-			return nil
-		}
-
-		logger.Info("Waiting for new pods to become healthy",
-			"available", len(podState.AvailablePods),
-			"expected", expectedPods,
-			"unhealthy", len(podState.UnhealthyPods))
-
-		time.Sleep(5 * time.Second)
-	}
-
-	return fmt.Errorf("timeout waiting for new pods to become healthy")
 }
 
 // SetupWithManager sets up the controller with the Manager.
