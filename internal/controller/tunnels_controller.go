@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	//appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,13 +63,6 @@ func removeElementFromList(slice []string, name string) []string {
 		}
 	}
 	return slice
-}
-
-type TunnelPodState struct {
-	DesiredReplicas int32
-	CurrentReplicas int32
-	AvailablePods   []string
-	UnhealthyPods   []string
 }
 
 func (r *TunnelsReconciler) getNodesName(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (string, error) {
@@ -290,7 +282,6 @@ func (r *TunnelsReconciler) createPod(ctx context.Context, tunnels *cftunnelargo
 	}
 
 	annotations := make(map[string]string)
-
 	if tunnels.GetAnnotations() != nil {
 		for k, v := range tunnels.GetAnnotations() {
 			annotations[k] = v
@@ -491,45 +482,20 @@ func (r *TunnelsReconciler) checkService(ctx context.Context, tunnels *cftunnela
 	return nil
 }
 
-func (r *TunnelsReconciler) checkPodsHealth(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels) (*TunnelPodState, error) {
-	logger := log.FromContext(ctx)
-	state := &TunnelPodState{
-		DesiredReplicas: tunnels.Spec.Replicas,
-	}
+func (r *TunnelsReconciler) isPodReady(ctx context.Context, pod *corev1.Pod) bool {
 
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(tunnels.Namespace), client.MatchingLabels{"app": tunnels.Name}); err != nil {
-		return nil, err
-	}
-
-	state.CurrentReplicas = int32(len(podList.Items))
-
-	for _, pod := range podList.Items {
-		if pod.Status.Phase == corev1.PodRunning {
-			state.AvailablePods = append(state.AvailablePods, pod.Name)
-		} else {
-			state.UnhealthyPods = append(state.UnhealthyPods, pod.Name)
-			logger.Info("Unhealthy pod detected", "pod", pod.Name, "phase", pod.Status.Phase)
-		}
-	}
-
-	return state, nil
-}
-
-func (r *TunnelsReconciler) isPodOutdated(ctx context.Context, tunnels *cftunnelargocontrollerv1alpha1.Tunnels, podName string) bool {
-	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{
-		Name:      podName,
-		Namespace: tunnels.Namespace,
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
 	}, pod); err != nil {
 		return false
 	}
 
-	oldResourceVersion := pod.Annotations["lastResourceVersion"]
-	if oldResourceVersion != tunnels.ResourceVersion {
-		return true
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return true
+		}
 	}
-
 	return false
 }
 
@@ -546,71 +512,56 @@ func (r *TunnelsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if err := r.checkSecret(ctx, &tunnels); err != nil {
-		logger.Error(err, "failed to check ConfigMap")
+		logger.Error(err, "failed to check Secret")
 		return ctrl.Result{}, err
 	}
-
 	if err := r.checkService(ctx, &tunnels); err != nil {
 		logger.Error(err, "failed to check Service")
 		return ctrl.Result{}, err
 	}
 
-	podState, err := r.checkPodsHealth(ctx, &tunnels)
-	if err != nil {
-		logger.Error(err, "failed to check pods health")
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(tunnels.Namespace),
+		client.MatchingLabels{"app": tunnels.Name}); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	desiredReplicas := int(tunnels.Spec.Replicas)
-	if len(podState.AvailablePods) < desiredReplicas {
-		logger.Info("Not enough running pods, creating new ones",
-			"current", len(podState.AvailablePods),
-			"desired", desiredReplicas)
-
-		for i := len(podState.AvailablePods); i < desiredReplicas; i++ {
-			nextIndex, err := r.findNextAvailableIndex(ctx, &tunnels)
-			if err != nil {
-				logger.Error(err, "failed to find next available index")
-				return ctrl.Result{}, err
-			}
-
-			if err := r.createPod(ctx, &tunnels, nextIndex); err != nil {
-				if !errors.IsAlreadyExists(err) {
-					logger.Error(err, "failed to create new pod", "index", nextIndex)
-					return ctrl.Result{}, err
-				}
-			}
-			logger.Info("Created new pod", "index", nextIndex)
+	newPods := make(map[string]*corev1.Pod)
+	oldPods := make(map[string]*corev1.Pod)
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Annotations["lastResourceVersion"] == tunnels.ResourceVersion {
+			newPods[pod.Name] = pod
+		} else {
+			oldPods[pod.Name] = pod
 		}
 	}
 
-	needsUpdate := false
-	for _, pod := range podState.AvailablePods {
-		if r.isPodOutdated(ctx, &tunnels, pod) {
-			needsUpdate = true
-			break
-		}
-	}
+	needsUpdate := len(oldPods) > 0 || len(newPods) != int(tunnels.Spec.Replicas)
 
 	if needsUpdate {
-		logger.Info("Starting rolling update of pods")
+		logger.Info("Update required",
+			"new_pods", len(newPods),
+			"old_pods", len(oldPods),
+			"desired_replicas", tunnels.Spec.Replicas)
 
-		newPods := make(map[string]bool)
+		var lastCreatedPod *corev1.Pod
+		for _, pod := range newPods {
+			if lastCreatedPod == nil || pod.CreationTimestamp.After(lastCreatedPod.CreationTimestamp.Time) {
+				lastCreatedPod = pod
+			}
+		}
 
-		for i := 0; i < len(podState.AvailablePods); i++ {
+		if lastCreatedPod != nil && !r.isPodReady(ctx, lastCreatedPod) {
+			logger.Info("Waiting for last created pod to be ready", "pod", lastCreatedPod.Name)
+			return ctrl.Result{RequeueAfter: time.Second * 10}, nil
+		}
+
+		if len(newPods) < int(tunnels.Spec.Replicas) {
 			nextIndex, err := r.findNextAvailableIndex(ctx, &tunnels)
 			if err != nil {
 				logger.Error(err, "failed to find next available index")
 				return ctrl.Result{}, err
-			}
-
-			podName := fmt.Sprintf("%s-tunnel-%d", tunnels.Name, nextIndex)
-
-			if err := r.Get(ctx, types.NamespacedName{
-				Name:      podName,
-				Namespace: tunnels.Namespace,
-			}, &corev1.Pod{}); err == nil {
-				continue
 			}
 
 			if err := r.createPod(ctx, &tunnels, nextIndex); err != nil {
@@ -619,57 +570,38 @@ func (r *TunnelsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					return ctrl.Result{}, err
 				}
 			}
-			newPods[podName] = true
-			logger.Info("Created new pod", "index", nextIndex)
+
+			logger.Info("Created new pod",
+				"index", nextIndex,
+				"current_new_pods", len(newPods),
+				"desired_replicas", tunnels.Spec.Replicas)
+
+			return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 		}
 
-		for _, podName := range podState.AvailablePods {
-			if !newPods[podName] {
-				pod := &corev1.Pod{}
-				if err := r.Get(ctx, types.NamespacedName{
-					Name:      podName,
-					Namespace: tunnels.Namespace,
-				}, pod); err != nil {
-					if !errors.IsNotFound(err) {
-						return ctrl.Result{}, err
-					}
-					continue
-				}
+		allNewPodsReady := true
+		for _, pod := range newPods {
+			if !r.isPodReady(ctx, pod) {
+				allNewPodsReady = false
+				logger.Info("Waiting for pod to be ready", "pod", pod.Name)
+				break
+			}
+		}
 
+		if !allNewPodsReady {
+			return ctrl.Result{RequeueAfter: time.Second * 10}, nil
+		}
+
+		if len(newPods) == int(tunnels.Spec.Replicas) && len(oldPods) > 0 {
+			for _, pod := range oldPods {
 				if err := r.Delete(ctx, pod); err != nil {
 					if !errors.IsNotFound(err) {
+						logger.Error(err, "failed to delete old pod", "pod", pod.Name)
 						return ctrl.Result{}, err
 					}
 				}
-				logger.Info("Deleted old pod", "pod", podName)
+				logger.Info("Deleted old pod", "pod", pod.Name)
 			}
-		}
-	}
-
-	if len(podState.AvailablePods) > desiredReplicas {
-		logger.Info("Too many running pods, removing excess",
-			"current", len(podState.AvailablePods),
-			"desired", desiredReplicas)
-
-		podsToRemove := len(podState.AvailablePods) - desiredReplicas
-		for i := 0; i < podsToRemove; i++ {
-			pod := &corev1.Pod{}
-			if err := r.Get(ctx, types.NamespacedName{
-				Name:      podState.AvailablePods[i],
-				Namespace: tunnels.Namespace,
-			}, pod); err != nil {
-				if !errors.IsNotFound(err) {
-					return ctrl.Result{}, err
-				}
-				continue
-			}
-
-			if err := r.Delete(ctx, pod); err != nil {
-				if !errors.IsNotFound(err) {
-					return ctrl.Result{}, err
-				}
-			}
-			logger.Info("Deleted excess pod", "pod", podState.AvailablePods[i])
 		}
 	}
 
