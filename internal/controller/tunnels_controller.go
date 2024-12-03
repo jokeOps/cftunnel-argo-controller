@@ -82,7 +82,7 @@ func (r *TunnelsReconciler) getNodesName(ctx context.Context, tunnels *cftunnela
 	nodes := []string{}
 
 	for _, node := range nodesName.Items {
-		if _, exists := node.Labels["node-role.kubernetes.io/control-plane"]; exists {
+		if len(node.Spec.Taints) > 0 {
 			continue
 		} else {
 			nodes = append(nodes, node.Name)
